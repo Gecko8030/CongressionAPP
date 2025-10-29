@@ -61,6 +61,8 @@ def create_data_generators(data_dir):
         shear_range=0.2,
         zoom_range=0.2,
         horizontal_flip=True,
+        brightness_range=(0.8, 1.2),
+        channel_shift_range=20.0,
         fill_mode='nearest'
     )
     
@@ -77,6 +79,7 @@ def create_data_generators(data_dir):
         target_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
         class_mode='categorical',
+        classes=CLASS_NAMES,  # force class index order
         shuffle=True,
         seed=42
     )
@@ -86,6 +89,7 @@ def create_data_generators(data_dir):
         target_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
         class_mode='categorical',
+        classes=CLASS_NAMES,  # force class index order
         shuffle=False
     )
     
@@ -94,6 +98,7 @@ def create_data_generators(data_dir):
         target_size=IMAGE_SIZE,
         batch_size=BATCH_SIZE,
         class_mode='categorical',
+        classes=CLASS_NAMES,  # force class index order
         shuffle=False
     )
     
@@ -166,6 +171,17 @@ def train_model():
     print(f"Train samples: {train_gen.samples}")
     print(f"Validation samples: {val_gen.samples}")
     print(f"Test samples: {test_gen.samples}")
+
+    # Persist class mapping for inference-time consistency
+    try:
+        import json
+        os.makedirs("models", exist_ok=True)
+        mapping_path = os.path.join("models", "class_indices.json")
+        with open(mapping_path, "w") as f:
+            json.dump(train_gen.class_indices, f, indent=2)
+        print(f"Saved class indices mapping to: {mapping_path}")
+    except Exception as e:
+        print(f"Warning: could not save class indices mapping: {e}")
     
     # Build model
     print("\n[2/5] Building model...")
@@ -185,6 +201,9 @@ def train_model():
             monitor='val_loss',
             patience=10,
             restore_best_weights=True
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5, patience=3, min_lr=1e-6, verbose=1
         ),
         keras.callbacks.ModelCheckpoint(
             MODEL_SAVE_PATH,
