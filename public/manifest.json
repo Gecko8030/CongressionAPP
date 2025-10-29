@@ -1,0 +1,41 @@
+{
+  "name": "CropIntel AR",
+  "short_name": "CropIntel",
+  "description": "AI-Powered Crop Disease Detection for Arkansas",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#16a34a",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"],
+  "shortcuts": [
+    {
+      "name": "Snap & Diagnose",
+      "short_name": "Diagnose",
+      "description": "Take a photo to diagnose crop disease",
+      "url": "/snap",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "View Alerts",
+      "short_name": "Alerts",
+      "description": "Check county risk alerts",
+      "url": "/alerts",
+      "icons": [{ "src": "/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}
