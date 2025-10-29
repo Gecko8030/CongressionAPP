@@ -25,7 +25,7 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, Model
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import MobileNetV3Small
+from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -34,8 +34,9 @@ from pathlib import Path
 IMAGE_SIZE = (224, 224)
 BATCH_SIZE = 32
 EPOCHS = 50
-LEARNING_RATE = 0.001
-DATA_DIR = "data"
+TOTAL_EPOCHS = 30  # Cap total training (initial + fine-tune) at 30
+LEARNING_RATE = 0.0001
+DATA_DIR = "data_normalized"
 MODEL_SAVE_PATH = "models/crop_disease_model.h5"
 TFLITE_SAVE_PATH = "models/crop_disease_model.tflite"
 
@@ -43,10 +44,10 @@ TFLITE_SAVE_PATH = "models/crop_disease_model.tflite"
 CLASS_NAMES = [
     "healthy",
     "sheath_blight",
-    "rice_blast", 
+    "rice_blast",
     "fall_armyworm",
     "brown_spot",
-    "leaf_folder"
+    "leaf_folder",
 ]
 
 def create_data_generators(data_dir):
@@ -102,17 +103,17 @@ def create_data_generators(data_dir):
 def build_model(num_classes=6):
     """Build the MobileNetV3-Small based model."""
     
-    # Load MobileNetV3-Small; try ImageNet weights, fall back to random init if offline
+    # Load MobileNetV2; prefer ImageNet weights, fallback to random init if offline
     try:
-        base_model = MobileNetV3Small(
+        base_model = MobileNetV2(
             input_shape=(*IMAGE_SIZE, 3),
             include_top=False,
             weights='imagenet',
             pooling='avg'
         )
-    except Exception as e:
+    except Exception:
         print("Could not load ImageNet weights (likely offline). Using random initialization.")
-        base_model = MobileNetV3Small(
+        base_model = MobileNetV2(
             input_shape=(*IMAGE_SIZE, 3),
             include_top=False,
             weights=None,
@@ -121,7 +122,7 @@ def build_model(num_classes=6):
     
     # Allow training on the last blocks from the start for more capacity
     base_model.trainable = True
-    for layer in base_model.layers[:-30]:
+    for layer in base_model.layers[:-40]:
         layer.trainable = False
     
     # Add custom classification head
@@ -179,12 +180,18 @@ def train_model():
         metrics=['accuracy']
     )
     
-    # Callbacks (simplify LR scheduling initially)
+    # Callbacks with gentle LR scheduling
     callbacks = [
         keras.callbacks.EarlyStopping(
             monitor='val_loss',
             patience=10,
             restore_best_weights=True
+        ),
+        keras.callbacks.ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.5,
+            patience=3,
+            min_lr=1e-6,
         ),
         keras.callbacks.ModelCheckpoint(
             MODEL_SAVE_PATH,
@@ -209,9 +216,11 @@ def train_model():
     print("Validation samples:", val_gen.samples)
     print("Class counts:", {cls: int(class_counts[idx]) for cls, idx in train_gen.class_indices.items()})
 
+    # Phase 1: initial training, limited by TOTAL_EPOCHS
+    initial_epochs = min(EPOCHS, TOTAL_EPOCHS)
     history = model.fit(
         train_gen,
-        epochs=EPOCHS,
+        epochs=initial_epochs,
         validation_data=val_gen,
         callbacks=callbacks,
         class_weight=class_weight,
@@ -224,19 +233,22 @@ def train_model():
     base_model.trainable = True  # Unfreeze more for fine-tuning
     
     model.compile(
-        optimizer=Adam(learning_rate=LEARNING_RATE * 0.1),  # Lower learning rate
+        optimizer=Adam(learning_rate=max(LEARNING_RATE * 0.3, 1e-5)),  # conservative fine-tune LR
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
     
-    # Continue training
-    history_fine = model.fit(
-        train_gen,
-        epochs=20,
-        validation_data=val_gen,
-        callbacks=callbacks,
-        verbose=1
-    )
+    # Continue training for remaining epochs (if any) to respect TOTAL_EPOCHS
+    remaining_epochs = max(0, TOTAL_EPOCHS - initial_epochs)
+    history_fine = None
+    if remaining_epochs > 0:
+        history_fine = model.fit(
+            train_gen,
+            epochs=remaining_epochs,
+            validation_data=val_gen,
+            callbacks=callbacks,
+            verbose=1
+        )
     
     # Evaluate on test set
     print("\n[5/5] Evaluating on test set...")
