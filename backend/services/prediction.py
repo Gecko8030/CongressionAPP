@@ -2,6 +2,9 @@ import io
 import numpy as np
 from PIL import Image
 from typing import Dict, List, Tuple
+import json
+import os
+import tensorflow as tf # Required for TFLite Interpreter
 
 class PredictionService:
     def __init__(self, model_path: str = "models/crop_disease_model.tflite"):
@@ -18,7 +21,6 @@ class PredictionService:
         ]
         # Try to load persisted class index mapping from training
         try:
-            import json, os
             mapping_path = os.path.join("models", "class_indices.json")
             if os.path.exists(mapping_path):
                 with open(mapping_path, "r") as f:
@@ -35,7 +37,6 @@ class PredictionService:
 
     def load_model(self):
         try:
-            import tensorflow as tf
             if self.model_path and tf.io.gfile.exists(self.model_path):
                 self.model = tf.lite.Interpreter(model_path=self.model_path)
                 self.model.allocate_tensors()
@@ -54,23 +55,38 @@ class PredictionService:
         if image.mode != "RGB":
             image = image.convert("RGB")
 
+        # Center-crop to square before resizing to preserve aspect ratio
+        w, h = image.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        image = image.crop((left, top, left + side, top + side))
         image = image.resize(self.input_size)
 
         img_array = np.array(image, dtype=np.float32)
-
-        img_array = img_array / 255.0
-
+        
+        # --- FIX: Normalize to [-1, 1] for MobileNetV2 ---
+        img_array /= 127.5
+        img_array -= 1.0
+        # --------------------------------------------------
+        
         img_array = np.expand_dims(img_array, axis=0)
-
         return img_array
 
     def _tta_images(self, image_bytes: bytes) -> np.ndarray:
         """Generate a small set of augmented views for test-time augmentation.
-        Returns an array of shape (N, H, W, 3) normalized to [0,1].
+        Returns an array of shape (N, H, W, 3) normalized to [-1, 1].
         """
         base = Image.open(io.BytesIO(image_bytes))
         if base.mode != "RGB":
             base = base.convert("RGB")
+            
+        # Center-crop to square for TTA variants as well
+        w, h = base.size
+        side = min(w, h)
+        left = (w - side) // 2
+        top = (h - side) // 2
+        base = base.crop((left, top, left + side, top + side))
         base = base.resize(self.input_size)
 
         variants = [
@@ -82,7 +98,13 @@ class PredictionService:
 
         arrays = []
         for im in variants:
-            arr = np.array(im, dtype=np.float32) / 255.0
+            arr = np.array(im, dtype=np.float32)
+            
+            # --- FIX: Normalize to [-1, 1] for MobileNetV2 ---
+            arr /= 127.5
+            arr -= 1.0
+            # --------------------------------------------------
+            
             arrays.append(arr)
         batch = np.stack(arrays, axis=0)
         return batch
@@ -121,11 +143,13 @@ class PredictionService:
                 "all_predictions": all_predictions
             }
         except Exception as e:
+            # This handles unexpected errors in the TTA/averaging/post-processing steps
             raise Exception(f"Prediction error: {str(e)}")
 
     def _run_inference(self, img_array: np.ndarray) -> np.ndarray:
         try:
             if self.model is None:
+                # This should not happen if load_model is called correctly
                 return self._mock_prediction(img_array)
             
             # Ensure dtype and quantization match model expectations
@@ -134,20 +158,27 @@ class PredictionService:
             inp = input_details[0]
 
             data = img_array
+            
+            # TFLite input handling logic (handling both float and quantized models)
             if inp["dtype"] == np.uint8:
-                # Quantize float [0,1] -> uint8 using scale/zero_point
+                # If the model is quantized, we need to convert the float [-1, 1] data back to uint8 [0, 255]
+                # Then apply the model's specific quantization parameters (scale/zero_point)
+                # Since the data is currently [-1, 1], we map it back to [0, 255] first
+                data_unnormalized = (data + 1.0) * 127.5
+                
                 scale, zero = inp.get("quantization", (0.0, 0))
                 if scale == 0:
-                    # Fallback: assume [0,255]
-                    data_q = (data * 255.0).astype(np.uint8)
+                    # Fallback: simple [0,255] assumption
+                    data_q = np.clip(data_unnormalized, 0, 255).astype(np.uint8)
                 else:
-                    data_q = np.clip(np.round(data / scale + zero), 0, 255).astype(np.uint8)
+                    data_q = np.clip(np.round(data_unnormalized / scale + zero), 0, 255).astype(np.uint8)
                 self.model.set_tensor(inp['index'], data_q)
             else:
-                # float32 path (model likely expects [0,1])
+                # float32 path (model expects data in the range it was trained on: [-1, 1])
                 if data.dtype != np.float32:
                     data = data.astype(np.float32)
                 self.model.set_tensor(inp['index'], data)
+                
             self.model.invoke()
 
             out = output_details[0]
@@ -168,12 +199,28 @@ class PredictionService:
                 probs = exps / np.sum(exps, axis=1, keepdims=True)
             return probs
         except Exception as e:
+            # The 'utf-8' error was caught here due to invalid data being passed to seed
             print(f"Inference failed, using mock: {e}")
             return self._mock_prediction(img_array)
 
-    def _mock_prediction(self, img_array: np.ndarray) -> np.ndarray:
+    def _mock_prediction(self, img_array: np.ndarray) -> Dict:
+        # Since the input array is now a NumPy array of floats, we seed correctly.
+        # This function now returns a properly formatted dictionary matching the predict signature.
         np.random.seed(int(np.sum(img_array) * 1000) % 2**32)
 
         predictions = np.random.dirichlet(np.ones(len(self.class_names)) * 2)
+        
+        predicted_class_idx = np.argmax(predictions)
+        confidence = float(predictions[predicted_class_idx])
 
-        return np.array([predictions])
+        all_predictions = [
+            {"class": self.class_names[i], "confidence": float(predictions[i])}
+            for i in range(len(self.class_names))
+        ]
+        all_predictions.sort(key=lambda x: x["confidence"], reverse=True)
+
+        return {
+            "prediction": self.class_names[predicted_class_idx],
+            "confidence": confidence,
+            "all_predictions": all_predictions
+        }
